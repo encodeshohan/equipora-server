@@ -971,6 +971,80 @@ app.post("/payments/checkout-verify", verifyToken, verifyRenter, async (req, res
     })
 })
 
+// my bookings (customer dashboard, paginated)
+app.get("/bookings/mine", verifyToken, verifyRenter, async (req, res) => {
+    const { page, limit, skip } = getPaging(req.query, 10)
+    const filter = { customerId: req.user._id.toString() }
+
+    const [items, total] = await Promise.all([
+        bookings.find(filter).sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit).toArray(),
+        bookings.countDocuments(filter),
+    ])
+
+    res.send({
+        items,
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+    })
+})
+
+// profile related apis (all roles, own profile only)
+const profileOf = (user) => ({
+    id: user._id.toString(),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    image: user.image ?? null,
+    phone: user.phone ?? "",
+    address: user.address ?? "",
+    createdAt: user.createdAt,
+})
+
+app.get("/profile", verifyToken, (req, res) => {
+    res.send(profileOf(req.user))
+})
+
+app.patch("/profile", verifyToken, async (req, res) => {
+    const body = req.body
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return res.status(400).send({ message: "Invalid request body" })
+    }
+
+    const name = trimmed(body.name, 2, 80)
+    if (!name) {
+        return res.status(400).send({ message: "Name must be 2 to 80 characters" })
+    }
+
+    let image = null
+    if (typeof body.image === "string" && body.image.trim() !== "") {
+        const value = body.image.trim()
+        if (value.length > 500 || !isHttpUrl(value)) {
+            return res.status(400).send({ message: "Image must be a valid http(s) link" })
+        }
+        image = value
+    }
+
+    const phone = typeof body.phone === "string" ? body.phone.trim() : ""
+    if (phone && !PHONE_PATTERN.test(phone)) {
+        return res.status(400).send({ message: "Phone number is invalid" })
+    }
+
+    const address = typeof body.address === "string" ? body.address.trim() : ""
+    if (address.length > 300) {
+        return res.status(400).send({ message: "Address is too long (300 characters max)" })
+    }
+
+    // only these four fields can change: never email, role or banned
+    await users.updateOne(
+        { _id: req.user._id },
+        { $set: { name, image, phone, address, updatedAt: new Date() } }
+    )
+
+    res.send(profileOf(await users.findOne({ _id: req.user._id })))
+})
+
 // 404 + error handler (Express 5 forwards rejected async handlers here)
 app.use((req, res) => {
     res.status(404).send({ message: "Not found" })
