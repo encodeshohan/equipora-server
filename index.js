@@ -1,6 +1,7 @@
 import express from "express"
 import cors from "cors"
 import "dotenv/config"
+import Stripe from "stripe"
 import { MongoClient, ObjectId } from "mongodb"
 
 const app = express()
@@ -248,6 +249,120 @@ const listEquipment = async (
 const canManage = (user, item) =>
     user.role === "admin" || item.ownerId === user._id.toString()
 
+// booking helpers
+const BOOKING_HOLD_MS = 35 * 60 * 1000
+const MAX_RENTAL_DAYS = 365
+const DAY_MS = 24 * 60 * 60 * 1000
+const PHONE_PATTERN = /^\+?[\d\s-]{7,20}$/
+const UNIT_LABELS = { daily: "day", weekly: "week", monthly: "month" }
+
+// "YYYY-MM-DD" in Bangladesh time
+const todayInDhaka = () =>
+    new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Dhaka" })
+
+const isValidDay = (value) => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return false
+    }
+    const date = new Date(`${value}T00:00:00Z`)
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+}
+
+// both days are inclusive
+const countDays = (start, end) =>
+    Math.round((Date.parse(end) - Date.parse(start)) / DAY_MS) + 1
+
+const rentalUnits = (rentalType, days) => {
+    if (rentalType === "weekly") return Math.ceil(days / 7)
+    if (rentalType === "monthly") return Math.ceil(days / 30)
+    return days
+}
+
+const validateBookingRequest = (body) => {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return { error: "Invalid request body" }
+    }
+
+    const equipmentId = toObjectId(body.equipmentId)
+    if (!equipmentId) return { error: "Invalid equipment id" }
+
+    const { startDate, endDate } = body
+    if (!isValidDay(startDate) || !isValidDay(endDate)) {
+        return { error: "Start and end dates are required" }
+    }
+    if (startDate < todayInDhaka()) {
+        return { error: "Start date cannot be in the past" }
+    }
+    if (endDate < startDate) {
+        return { error: "End date cannot be before the start date" }
+    }
+    if (countDays(startDate, endDate) > MAX_RENTAL_DAYS) {
+        return { error: `Rentals are limited to ${MAX_RENTAL_DAYS} days` }
+    }
+
+    const quantity = toNumber(body.quantity)
+    if (!Number.isInteger(quantity) || quantity < 1) {
+        return { error: "Quantity must be a whole number of at least 1" }
+    }
+
+    const contactNumber = trimmed(body.contactNumber, 7, 20)
+    if (!contactNumber || !PHONE_PATTERN.test(contactNumber)) {
+        return { error: "Contact number is invalid" }
+    }
+
+    const deliveryAddress = trimmed(body.deliveryAddress, 5, 300)
+    if (!deliveryAddress) {
+        return { error: "Delivery address is required (5 to 300 characters)" }
+    }
+
+    const notes = typeof body.notes === "string" ? body.notes.trim() : ""
+    if (notes.length > 500) {
+        return { error: "Notes are too long (500 characters max)" }
+    }
+
+    return {
+        data: { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes },
+    }
+}
+
+// highest number of units reserved on any single day of the requested range.
+// Counts confirmed/completed bookings and recent unpaid holds. `beforeId`
+// restricts the count to bookings inserted earlier (race guard).
+const getReservedPeak = async ({ equipmentId, startDate, endDate, beforeId }) => {
+    const holdCutoff = new Date(Date.now() - BOOKING_HOLD_MS)
+    const filter = {
+        equipmentId,
+        startDate: { $lte: endDate },
+        endDate: { $gte: startDate },
+        $or: [
+            { bookingStatus: { $in: ["confirmed", "completed"] } },
+            { bookingStatus: "pending", createdAt: { $gte: holdCutoff } },
+        ],
+    }
+    if (beforeId) filter._id = { $lt: beforeId }
+
+    const overlapping = await bookings
+        .find(filter, { projection: { startDate: 1, endDate: 1, quantity: 1 } })
+        .toArray()
+
+    const points = new Set([startDate])
+    for (const booking of overlapping) {
+        if (booking.startDate > startDate) points.add(booking.startDate)
+    }
+
+    let peak = 0
+    for (const point of points) {
+        let sum = 0
+        for (const booking of overlapping) {
+            if (booking.startDate <= point && booking.endDate >= point) {
+                sum += booking.quantity
+            }
+        }
+        peak = Math.max(peak, sum)
+    }
+    return peak
+}
+
 // middleware
 const allowedOrigins = (process.env.CLIENT_URLS || "http://localhost:3000")
     .split(",")
@@ -268,6 +383,26 @@ app.use(
         allowedHeaders: ["Content-Type", "Authorization"],
     })
 )
+
+// payments config
+const stripe = process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null
+const CLIENT_URL = (process.env.CLIENT_URL || allowedOrigins[0]).replace(/\/$/, "")
+const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || "bdt").toLowerCase()
+const BDT_PER_UNIT = Number(process.env.STRIPE_BDT_PER_UNIT) || 0
+const paymentsConfigured =
+    Boolean(stripe) && (STRIPE_CURRENCY === "bdt" || BDT_PER_UNIT > 0)
+
+if (!paymentsConfigured) {
+    console.warn("Stripe is not fully configured: bookings will return 503")
+}
+
+// prices are in BDT; Stripe amounts are in the smallest currency unit
+const toChargeAmount = (totalBdt) =>
+    STRIPE_CURRENCY === "bdt"
+        ? Math.round(totalBdt * 100)
+        : Math.round((totalBdt / BDT_PER_UNIT) * 100)
 
 // mongodb connection (top-level await, same as the mentor)
 if (!process.env.MONGODB_URI) {
@@ -302,6 +437,9 @@ try {
     await equipment.createIndex({ status: 1, createdAt: -1 })
     await equipment.createIndex({ ownerId: 1, createdAt: -1 })
     await equipment.createIndex({ category: 1, status: 1 })
+    await bookings.createIndex({ equipmentId: 1, startDate: 1, endDate: 1 })
+    await bookings.createIndex({ customerId: 1, createdAt: -1 })
+    await bookings.createIndex({ ownerId: 1, createdAt: -1 })
 } catch (err) {
     console.error("Index setup failed:", err.message)
 }
@@ -611,6 +749,226 @@ app.delete("/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res
         equipmentId: equipmentId.toString(),
     })
     res.send(result)
+})
+
+// bookings + payments related apis (customers only)
+app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
+    if (!paymentsConfigured) {
+        return res.status(503).send({ message: "Payments are not configured" })
+    }
+
+    const { data, error } = validateBookingRequest(req.body)
+    if (error) return res.status(400).send({ message: error })
+
+    const item = await equipment.findOne({ _id: data.equipmentId, status: "approved" })
+    if (!item) return res.status(404).send({ message: "Equipment not found" })
+
+    if (data.quantity > item.quantity) {
+        return res.status(400).send({
+            message:
+                item.quantity === 0
+                    ? "This equipment is currently unavailable"
+                    : `Only ${item.quantity} available`,
+        })
+    }
+
+    const equipmentId = item._id.toString()
+    const reserved = await getReservedPeak({
+        equipmentId,
+        startDate: data.startDate,
+        endDate: data.endDate,
+    })
+    if (reserved + data.quantity > item.quantity) {
+        return res.status(409).send({
+            message: "Not enough quantity is available for these dates",
+        })
+    }
+
+    // the total is always computed here from the stored price
+    const days = countDays(data.startDate, data.endDate)
+    const units = rentalUnits(item.rentalType, days)
+    const total = Math.round(item.price * units * data.quantity * 100) / 100
+    const chargeAmount = toChargeAmount(total)
+    if (!Number.isSafeInteger(chargeAmount) || chargeAmount < 1) {
+        return res.status(400).send({ message: "Total is invalid" })
+    }
+
+    const now = new Date()
+    const booking = {
+        equipmentId,
+        equipmentName: item.name,
+        equipmentImage: item.image,
+        category: item.category,
+        location: item.location,
+        ownerId: item.ownerId,
+        ownerName: item.ownerName,
+        customerId: req.user._id.toString(),
+        customerName: req.user.name,
+        customerEmail: req.user.email,
+        customerImage: req.user.image ?? null,
+        startDate: data.startDate,
+        endDate: data.endDate,
+        days,
+        rentalType: item.rentalType,
+        units,
+        unitPrice: item.price,
+        quantity: data.quantity,
+        total,
+        currency: "bdt",
+        chargeAmount,
+        chargeCurrency: STRIPE_CURRENCY,
+        contactNumber: data.contactNumber,
+        deliveryAddress: data.deliveryAddress,
+        notes: data.notes,
+        paymentStatus: "unpaid",
+        bookingStatus: "pending",
+        createdAt: now,
+        updatedAt: now,
+    }
+
+    const inserted = await bookings.insertOne(booking)
+
+    // race guard: only bookings inserted before this one count
+    const earlier = await getReservedPeak({
+        equipmentId,
+        startDate: data.startDate,
+        endDate: data.endDate,
+        beforeId: inserted.insertedId,
+    })
+    if (earlier + data.quantity > item.quantity) {
+        await bookings.deleteOne({ _id: inserted.insertedId })
+        return res.status(409).send({
+            message: "Not enough quantity is available for these dates",
+        })
+    }
+
+    try {
+        const unitLabel = UNIT_LABELS[item.rentalType]
+        const session = await stripe.checkout.sessions.create({
+            mode: "payment",
+            customer_email: req.user.email,
+            line_items: [
+                {
+                    quantity: 1,
+                    price_data: {
+                        currency: STRIPE_CURRENCY,
+                        unit_amount: chargeAmount,
+                        product_data: {
+                            name: `${item.name} (${data.quantity} x ${units} ${unitLabel}${units === 1 ? "" : "s"})`.slice(0, 200),
+                            description: `${data.startDate} to ${data.endDate}`,
+                        },
+                    },
+                },
+            ],
+            metadata: {
+                bookingId: inserted.insertedId.toString(),
+                userId: req.user._id.toString(),
+            },
+            expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
+            success_url: `${CLIENT_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${CLIENT_URL}/equipment/${equipmentId}?canceled=1`,
+        })
+
+        await bookings.updateOne(
+            { _id: inserted.insertedId },
+            { $set: { stripeSessionId: session.id } }
+        )
+        res.status(201).send({ bookingId: inserted.insertedId, url: session.url, total })
+    } catch (err) {
+        console.error("Stripe session failed:", err.message)
+        await bookings.deleteOne({ _id: inserted.insertedId })
+        res.status(502).send({ message: "Payment service is unavailable. Please try again." })
+    }
+})
+
+app.post("/payments/checkout-verify", verifyToken, verifyRenter, async (req, res) => {
+    if (!paymentsConfigured) {
+        return res.status(503).send({ message: "Payments are not configured" })
+    }
+
+    const sessionId = req.body?.sessionId
+    if (typeof sessionId !== "string" || !/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)) {
+        return res.status(400).send({ message: "Invalid session id" })
+    }
+
+    let session
+    try {
+        session = await stripe.checkout.sessions.retrieve(sessionId)
+    } catch (err) {
+        console.error("Stripe retrieve failed:", err.message)
+        return res.status(404).send({ message: "Checkout session not found" })
+    }
+
+    // the session must belong to the logged-in user
+    const userId = req.user._id.toString()
+    if (session.metadata?.userId !== userId) {
+        return res.status(403).send({ message: "Forbidden" })
+    }
+
+    const bookingId = toObjectId(session.metadata?.bookingId)
+    if (!bookingId) return res.status(400).send({ message: "Invalid booking" })
+
+    const booking = await bookings.findOne({
+        _id: bookingId,
+        customerId: userId,
+        stripeSessionId: sessionId,
+    })
+    if (!booking) return res.status(404).send({ message: "Booking not found" })
+
+    if (session.status !== "complete" || session.payment_status !== "paid") {
+        return res.send({ success: false, message: "Payment has not been completed." })
+    }
+
+    if (
+        session.amount_total !== booking.chargeAmount ||
+        session.currency !== booking.chargeCurrency
+    ) {
+        console.error("Payment amount mismatch for booking", booking._id.toString())
+        return res.status(409).send({ message: "Payment does not match the booking" })
+    }
+
+    // replay protection: the unique index on sessionId allows one record only
+    let alreadyVerified = false
+    try {
+        await payments.insertOne({
+            sessionId,
+            bookingId: booking._id.toString(),
+            userId,
+            customerEmail: booking.customerEmail,
+            equipmentId: booking.equipmentId,
+            ownerId: booking.ownerId,
+            amount: booking.total,
+            currency: booking.currency,
+            status: "paid",
+            transactionId:
+                typeof session.payment_intent === "string" ? session.payment_intent : sessionId,
+            paymentDate: new Date(),
+        })
+    } catch (err) {
+        if (err.code !== 11000) throw err
+        alreadyVerified = true
+    }
+
+    await bookings.updateOne(
+        { _id: booking._id, paymentStatus: "unpaid" },
+        {
+            $set: {
+                paymentStatus: "paid",
+                bookingStatus: "confirmed",
+                paidAt: new Date(),
+                updatedAt: new Date(),
+            },
+        }
+    )
+
+    const updated = await bookings.findOne({ _id: booking._id })
+    const payment = await payments.findOne({ sessionId })
+    res.send({
+        success: true,
+        alreadyVerified,
+        booking: updated,
+        transactionId: payment?.transactionId ?? null,
+    })
 })
 
 // 404 + error handler (Express 5 forwards rejected async handlers here)
