@@ -656,13 +656,18 @@ app.delete("/equipment/:id", verifyToken, async (req, res) => {
         return res.status(403).send({ message: "Forbidden" })
     }
 
+    // confirmed bookings, or an unpaid checkout that is still open
+    const holdCutoff = new Date(Date.now() - BOOKING_HOLD_MS)
     const activeBooking = await bookings.findOne({
         equipmentId: id.toString(),
-        bookingStatus: "confirmed",
+        $or: [
+            { bookingStatus: "confirmed" },
+            { bookingStatus: "pending", createdAt: { $gte: holdCutoff } },
+        ],
     })
     if (activeBooking) {
         return res.status(409).send({
-            message: "This equipment has confirmed bookings and cannot be deleted.",
+            message: "This equipment has active bookings and cannot be deleted right now.",
         })
     }
 
@@ -1043,6 +1048,31 @@ app.patch("/profile", verifyToken, async (req, res) => {
     )
 
     res.send(profileOf(await users.findOne({ _id: req.user._id })))
+})
+
+// owner dashboard: paid bookings of my equipment
+app.get("/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
+    const { page, limit, skip } = getPaging(req.query, 10)
+    const filter = { ownerId: req.user._id.toString(), paymentStatus: "paid" }
+    const projection = { stripeSessionId: 0, chargeAmount: 0, chargeCurrency: 0 }
+
+    const [items, total] = await Promise.all([
+        bookings
+            .find(filter, { projection })
+            .sort({ createdAt: -1, _id: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        bookings.countDocuments(filter),
+    ])
+
+    res.send({
+        items,
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+    })
 })
 
 // 404 + error handler (Express 5 forwards rejected async handlers here)
