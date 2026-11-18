@@ -545,6 +545,74 @@ app.get("/admin/equipment", verifyToken, verifyAdmin, async (req, res) => {
     res.send(await listEquipment(filter, req.query, { defaultLimit: 10 }))
 })
 
+// favorites related apis (customers only)
+app.get("/favorites/ids", verifyToken, verifyRenter, async (req, res) => {
+    const docs = await favorites
+        .find({ userId: req.user._id.toString() }, { projection: { equipmentId: 1 } })
+        .toArray()
+    res.send(docs.map((doc) => doc.equipmentId))
+})
+
+app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
+    const docs = await favorites
+        .find({ userId: req.user._id.toString() })
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray()
+
+    const ids = docs.map((doc) => toObjectId(doc.equipmentId)).filter(Boolean)
+    const items = await equipment
+        .find({ _id: { $in: ids }, status: "approved" }, { projection: PUBLIC_PROJECTION })
+        .toArray()
+    const byId = new Map(items.map((item) => [item._id.toString(), item]))
+
+    res.send(
+        docs
+            .filter((doc) => byId.has(doc.equipmentId))
+            .map((doc) => ({
+                ...byId.get(doc.equipmentId),
+                favoriteId: doc._id,
+                favoritedAt: doc.createdAt,
+            }))
+    )
+})
+
+app.post("/favorites", verifyToken, verifyRenter, async (req, res) => {
+    const equipmentId = toObjectId(req.body?.equipmentId)
+    if (!equipmentId) return res.status(400).send({ message: "Invalid id" })
+
+    const item = await equipment.findOne(
+        { _id: equipmentId, status: "approved" },
+        { projection: { _id: 1 } }
+    )
+    if (!item) return res.status(404).send({ message: "Equipment not found" })
+
+    try {
+        const result = await favorites.insertOne({
+            userId: req.user._id.toString(),
+            equipmentId: equipmentId.toString(),
+            createdAt: new Date(),
+        })
+        res.status(201).send(result)
+    } catch (err) {
+        // the unique index makes a double click harmless
+        if (err.code === 11000) {
+            return res.send({ acknowledged: true, alreadyFavorite: true })
+        }
+        throw err
+    }
+})
+
+app.delete("/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res) => {
+    const equipmentId = toObjectId(req.params.equipmentId)
+    if (!equipmentId) return res.status(400).send({ message: "Invalid id" })
+
+    const result = await favorites.deleteOne({
+        userId: req.user._id.toString(),
+        equipmentId: equipmentId.toString(),
+    })
+    res.send(result)
+})
+
 // 404 + error handler (Express 5 forwards rejected async handlers here)
 app.use((req, res) => {
     res.status(404).send({ message: "Not found" })
