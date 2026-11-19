@@ -1207,6 +1207,118 @@ app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
     })
 })
 
+// analytics helpers
+const MONTH_NAMES = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+// the last `count` months (oldest first), in Bangladesh time
+const lastMonths = (count) => {
+    const [year, month] = todayInDhaka().split("-").map(Number)
+    const months = []
+    for (let back = count - 1; back >= 0; back--) {
+        const date = new Date(Date.UTC(year, month - 1 - back, 1))
+        const y = date.getUTCFullYear()
+        const m = date.getUTCMonth()
+        months.push({
+            key: `${y}-${String(m + 1).padStart(2, "0")}`,
+            label: `${MONTH_NAMES[m]} ${y}`,
+        })
+    }
+    return months
+}
+
+const roundMoney = (value) => Math.round((value ?? 0) * 100) / 100
+
+// paid bookings per month: { month, label, bookings, revenue }
+const monthlyStats = async (baseFilter, count = 6) => {
+    const months = lastMonths(count)
+    const start = new Date(`${months[0].key}-01T00:00:00+06:00`)
+
+    const rows = await bookings
+        .aggregate([
+            {
+                $match: { ...baseFilter, paymentStatus: "paid", paidAt: { $gte: start } },
+            },
+            {
+                $group: {
+                    _id: {
+                        $dateToString: { format: "%Y-%m", date: "$paidAt", timezone: "Asia/Dhaka" },
+                    },
+                    bookings: { $sum: 1 },
+                    revenue: { $sum: "$total" },
+                },
+            },
+        ])
+        .toArray()
+    const byMonth = new Map(rows.map((row) => [row._id, row]))
+
+    return months.map(({ key, label }) => ({
+        month: key,
+        label,
+        bookings: byMonth.get(key)?.bookings ?? 0,
+        revenue: roundMoney(byMonth.get(key)?.revenue),
+    }))
+}
+
+const sumPaid = async (filter) => {
+    const [row] = await bookings
+        .aggregate([
+            { $match: { ...filter, paymentStatus: "paid" } },
+            { $group: { _id: null, total: { $sum: "$total" } } },
+        ])
+        .toArray()
+    return roundMoney(row?.total)
+}
+
+// admin analytics
+app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
+    const [
+        totalUsers,
+        totalEquipment,
+        pendingApprovals,
+        totalBookings,
+        completedRentals,
+        totalRevenue,
+        monthly,
+    ] = await Promise.all([
+        users.countDocuments({}),
+        equipment.countDocuments({}),
+        equipment.countDocuments({ status: "pending" }),
+        bookings.countDocuments({ paymentStatus: "paid" }),
+        bookings.countDocuments({ bookingStatus: "completed" }),
+        sumPaid({}),
+        monthlyStats({}),
+    ])
+
+    res.send({
+        totalUsers,
+        totalEquipment,
+        pendingApprovals,
+        totalBookings,
+        completedRentals,
+        totalRevenue,
+        monthly,
+    })
+})
+
+// owner analytics: only my own equipment and bookings
+app.get("/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
+    const ownerId = req.user._id.toString()
+
+    const [listedEquipment, paidRentals, completedRentals, totalEarnings, monthly] =
+        await Promise.all([
+            equipment.countDocuments({ ownerId }),
+            bookings.countDocuments({ ownerId, paymentStatus: "paid" }),
+            bookings.countDocuments({ ownerId, bookingStatus: "completed" }),
+            sumPaid({ ownerId }),
+            monthlyStats({ ownerId }),
+        ])
+
+    res.send({ listedEquipment, paidRentals, completedRentals, totalEarnings, monthly })
+})
+
 // 404 + error handler (Express 5 forwards rejected async handlers here)
 app.use((req, res) => {
     res.status(404).send({ message: "Not found" })
