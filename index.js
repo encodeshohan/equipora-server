@@ -1075,6 +1075,138 @@ app.get("/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
     })
 })
 
+// admin: users
+const USER_ROLE_VALUES = ["customer", "owner", "admin"]
+
+const adminUserOf = (user) => ({
+    id: user._id.toString(),
+    name: user.name,
+    email: user.email,
+    role: USER_ROLE_VALUES.includes(user.role) ? user.role : "customer",
+    image: user.image ?? null,
+    banned: Boolean(user.banned),
+    createdAt: user.createdAt,
+})
+
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+    const { page, limit, skip } = getPaging(req.query, 10)
+    const filter = {}
+
+    const role = queryString(req.query.role)
+    if (USER_ROLE_VALUES.includes(role)) filter.role = role
+
+    const search = queryString(req.query.search)
+    if (search) {
+        const pattern = searchPattern(search)
+        filter.$or = [{ name: pattern }, { email: pattern }]
+    }
+
+    const projection = { name: 1, email: 1, role: 1, image: 1, banned: 1, createdAt: 1 }
+    const [items, total] = await Promise.all([
+        users
+            .find(filter, { projection })
+            .sort({ createdAt: -1, _id: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        users.countDocuments(filter),
+    ])
+
+    res.send({
+        items: items.map(adminUserOf),
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+    })
+})
+
+app.patch("/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+    const id = toObjectId(req.params.id)
+    if (!id) return res.status(400).send({ message: "Invalid id" })
+
+    const role = req.body?.role
+    if (!USER_ROLE_VALUES.includes(role)) {
+        return res.status(400).send({ message: "Role is invalid" })
+    }
+    if (id.equals(req.user._id)) {
+        return res.status(400).send({ message: "You cannot change your own role" })
+    }
+
+    const result = await users.updateOne(
+        { _id: id },
+        { $set: { role, updatedAt: new Date() } }
+    )
+    if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "User not found" })
+    }
+
+    res.send(result)
+})
+
+app.patch("/admin/users/:id/ban", verifyToken, verifyAdmin, async (req, res) => {
+    const id = toObjectId(req.params.id)
+    if (!id) return res.status(400).send({ message: "Invalid id" })
+
+    const banned = req.body?.banned
+    if (typeof banned !== "boolean") {
+        return res.status(400).send({ message: "banned must be true or false" })
+    }
+    if (id.equals(req.user._id)) {
+        return res.status(400).send({ message: "You cannot suspend your own account" })
+    }
+
+    const target = await users.findOne({ _id: id }, { projection: { role: 1 } })
+    if (!target) return res.status(404).send({ message: "User not found" })
+    if (target.role === "admin" && banned) {
+        return res.status(400).send({
+            message: "Change this user's role before suspending the account",
+        })
+    }
+
+    await users.updateOne({ _id: id }, { $set: { banned, updatedAt: new Date() } })
+    // log the user out everywhere (sessions may store the id as text or ObjectId)
+    if (banned) {
+        await sessions.deleteMany({ userId: { $in: [id, id.toString()] } })
+    }
+
+    res.send({ acknowledged: true, banned })
+})
+
+// admin: all rentals
+const PAYMENT_STATUSES = ["paid", "unpaid"]
+const BOOKING_STATUSES = ["pending", "confirmed", "completed", "cancelled"]
+
+app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+    const { page, limit, skip } = getPaging(req.query, 10)
+    const filter = {}
+
+    const paymentStatus = queryString(req.query.paymentStatus)
+    if (PAYMENT_STATUSES.includes(paymentStatus)) filter.paymentStatus = paymentStatus
+
+    const bookingStatus = queryString(req.query.bookingStatus)
+    if (BOOKING_STATUSES.includes(bookingStatus)) filter.bookingStatus = bookingStatus
+
+    const projection = { stripeSessionId: 0, chargeAmount: 0, chargeCurrency: 0 }
+    const [items, total] = await Promise.all([
+        bookings
+            .find(filter, { projection })
+            .sort({ createdAt: -1, _id: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        bookings.countDocuments(filter),
+    ])
+
+    res.send({
+        items,
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+    })
+})
+
 // 404 + error handler (Express 5 forwards rejected async handlers here)
 app.use((req, res) => {
     res.status(404).send({ message: "Not found" })
