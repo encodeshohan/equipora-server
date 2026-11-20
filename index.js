@@ -3,6 +3,7 @@ import cors from "cors"
 import "dotenv/config"
 import Stripe from "stripe"
 import { MongoClient, ObjectId } from "mongodb"
+import { createRemoteJWKSet, jwtVerify } from "jose"
 
 const app = express()
 const port = process.env.PORT || 5000
@@ -453,8 +454,14 @@ const toObjectId = (id) => {
 }
 
 // middlewares
-// reads `Authorization: Bearer <token>`, finds it in the better-auth
-// `session` collection and puts the user on req.user
+// The client (better-auth jwt plugin) signs a short-lived JWT. The server
+// checks the signature against the client's public keys, so it never needs
+// the session collection or any shared secret.
+const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`))
+
+// reads `Authorization: Bearer <jwt>`, verifies it (signature, issuer,
+// audience, expiry), then loads the user so role and suspension are always
+// current, not frozen inside the token
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -466,16 +473,18 @@ const verifyToken = async (req, res, next) => {
         return res.status(401).send({ message: "Unauthorized" })
     }
 
-    const session = await sessions.findOne({ token })
-    if (!session) {
+    let payload
+    try {
+        ; ({ payload } = await jwtVerify(token, JWKS, {
+            issuer: CLIENT_URL,
+            audience: CLIENT_URL,
+        }))
+    } catch (err) {
+        console.error("JWT verification failed:", err.code ?? err.message)
         return res.status(401).send({ message: "Unauthorized" })
     }
 
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-        return res.status(401).send({ message: "Unauthorized" })
-    }
-
-    const userId = toObjectId(session.userId)
+    const userId = toObjectId(payload.sub ?? payload.id)
     if (!userId) {
         return res.status(401).send({ message: "Unauthorized" })
     }
