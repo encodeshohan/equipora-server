@@ -99,8 +99,11 @@ The frontend signs users in with Better Auth and sends a JWT in the `Authorizati
 - Admins list users, change roles and suspend or restore accounts
 - Admins cannot change or suspend their own account, or suspend another admin
 - Admins see every booking, with payment and booking status filters
+- Admins can cancel a rental or mark a paid rental as completed (cancelling an unpaid booking also closes its Stripe page)
 - Admin analytics: users, equipment, pending approvals, paid bookings and gross revenue
 - Owner analytics: listed equipment, paid rentals and gross earnings
+- Customer analytics: total rentals, paid rentals, completed rentals and total spent
+- Revenue, earnings and monthly charts are calculated from the `payments` collection
 - Charts data for the last 6 months, grouped by month in Bangladesh time
 
 ### 8. 🧪 Strict Input Validation
@@ -172,6 +175,7 @@ created  →  pending + unpaid  →  Stripe verified  →  confirmed + paid  →
 | POST | `/bookings/checkout` | Validate, hold stock and create a Stripe session |
 | GET | `/bookings/mine` | My bookings, paginated |
 | POST | `/payments/checkout-verify` | Confirm a paid Stripe session |
+| GET | `/customer/analytics` | My rentals, spending and monthly chart data |
 
 ### Owner
 
@@ -199,6 +203,7 @@ created  →  pending + unpaid  →  Stripe verified  →  confirmed + paid  →
 | PATCH | `/admin/users/:id/role` | Change a user's role |
 | PATCH | `/admin/users/:id/ban` | Suspend or restore a user |
 | GET | `/admin/bookings` | All bookings. Query: `paymentStatus`, `bookingStatus` |
+| PATCH | `/admin/bookings/:id/status` | Cancel a pending or confirmed booking, or mark a confirmed booking completed |
 | GET | `/admin/analytics` | Platform statistics |
 
 Errors use the shape `{ "message": "..." }` with status 400, 401, 403, 404, 409, 500, 502 or 503.
@@ -311,7 +316,7 @@ The API runs at <http://localhost:5000>.
 ## 📝 Notes
 
 - Dates are compared as `YYYY-MM-DD` strings in Bangladesh time (Asia/Dhaka). A rental can start today.
-- Revenue and earnings are gross amounts paid by customers, and analytics count paid bookings only.
+- Revenue and earnings are gross amounts from verified payments (the `payments` collection). Cancelling a paid booking does not refund it automatically, so refunds are handled in the Stripe dashboard.
 - CORS allows only the origins in `CLIENT_URLS`, so Vercel preview deployments on other URLs cannot call the API.
 - Bookings are marked as Completed automatically once their end date has passed. The check runs whenever bookings or analytics are loaded, so no cron job is needed on serverless hosting.
 
