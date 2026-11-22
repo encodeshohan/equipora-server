@@ -83,6 +83,7 @@ The frontend signs users in with Better Auth and sends a JWT in the `Authorizati
 - Availability counts confirmed bookings plus unpaid holds younger than 35 minutes, using the peak overlap across the requested dates
 - A race guard re-checks availability after saving and removes the booking if another customer won
 - The total is always calculated on the server from the stored price, with weekly and monthly rentals rounded up
+- Paid rentals are marked **Completed** automatically once their end date has passed (Bangladesh time)
 
 ### 6. 💳 Stripe Payments with Replay Protection
 
@@ -134,7 +135,7 @@ Unique indexes on `{ userId, equipmentId }` for favorites and on `sessionId` for
 ### Booking lifecycle
 
 ```
-created  →  pending + unpaid  →  Stripe verified  →  confirmed + paid
+created  →  pending + unpaid  →  Stripe verified  →  confirmed + paid  →  completed (after end date)
 ```
 
 ---
@@ -312,13 +313,12 @@ The API runs at <http://localhost:5000>.
 - Dates are compared as `YYYY-MM-DD` strings in Bangladesh time (Asia/Dhaka). A rental can start today.
 - Revenue and earnings are gross amounts paid by customers, and analytics count paid bookings only.
 - CORS allows only the origins in `CLIENT_URLS`, so Vercel preview deployments on other URLs cannot call the API.
-- Bookings are not moved to `completed` automatically, so completed-rental counts stay at 0.
+- Bookings are marked as Completed automatically once their end date has passed. The check runs whenever bookings or analytics are loaded, so no cron job is needed on serverless hosting.
 
 ---
 
 ## 📌 Future Improvements
 
-- ⏰ Scheduled job to mark bookings as completed after their end date
 - 🪝 Stripe webhook to confirm payments without the success page
 - 📧 Email notifications for bookings and approvals
 - 🚦 Rate limiting on public routes
