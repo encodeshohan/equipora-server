@@ -364,6 +364,25 @@ const getReservedPeak = async ({ equipmentId, startDate, endDate, beforeId }) =>
     return peak
 }
 
+// paid + confirmed rentals whose end date is before today become completed.
+// Dates are "YYYY-MM-DD" strings, so a plain string comparison is correct.
+// Runs before any route that reads bookings (no cron needed on serverless).
+const completeFinishedBookings = async () => {
+    try {
+        await bookings.updateMany(
+            {
+                paymentStatus: "paid",
+                bookingStatus: "confirmed",
+                endDate: { $lt: todayInDhaka() },
+            },
+            { $set: { bookingStatus: "completed", updatedAt: new Date() } }
+        )
+    } catch (err) {
+        // never block a read because the status sweep failed
+        console.error("Completing bookings failed:", err.message)
+    }
+}
+
 // middleware
 const allowedOrigins = (process.env.CLIENT_URLS || "http://localhost:3000")
     .split(",")
@@ -429,7 +448,6 @@ const equipment = database.collection("equipment")
 const bookings = database.collection("bookings")
 const favorites = database.collection("favorites")
 const payments = database.collection("payments")
-const reviews = database.collection("reviews")
 
 // indexes: block payment replays and duplicate favorites at the DB level
 try {
@@ -441,6 +459,7 @@ try {
     await bookings.createIndex({ equipmentId: 1, startDate: 1, endDate: 1 })
     await bookings.createIndex({ customerId: 1, createdAt: -1 })
     await bookings.createIndex({ ownerId: 1, createdAt: -1 })
+    await bookings.createIndex({ paymentStatus: 1, bookingStatus: 1, endDate: 1 })
 } catch (err) {
     console.error("Index setup failed:", err.message)
 }
@@ -664,6 +683,9 @@ app.delete("/equipment/:id", verifyToken, async (req, res) => {
     if (!canManage(req.user, item)) {
         return res.status(403).send({ message: "Forbidden" })
     }
+
+    // finished rentals are marked completed first, so they never block a delete
+    await completeFinishedBookings()
 
     // confirmed bookings, or an unpaid checkout that is still open
     const holdCutoff = new Date(Date.now() - BOOKING_HOLD_MS)
@@ -987,6 +1009,8 @@ app.post("/payments/checkout-verify", verifyToken, verifyRenter, async (req, res
 
 // my bookings (customer dashboard, paginated)
 app.get("/bookings/mine", verifyToken, verifyRenter, async (req, res) => {
+    await completeFinishedBookings()
+
     const { page, limit, skip } = getPaging(req.query, 10)
     const filter = { customerId: req.user._id.toString() }
 
@@ -1061,6 +1085,8 @@ app.patch("/profile", verifyToken, async (req, res) => {
 
 // owner dashboard: paid bookings of my equipment
 app.get("/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
+    await completeFinishedBookings()
+
     const { page, limit, skip } = getPaging(req.query, 10)
     const filter = { ownerId: req.user._id.toString(), paymentStatus: "paid" }
     const projection = { stripeSessionId: 0, chargeAmount: 0, chargeCurrency: 0 }
@@ -1187,6 +1213,8 @@ const PAYMENT_STATUSES = ["paid", "unpaid"]
 const BOOKING_STATUSES = ["pending", "confirmed", "completed", "cancelled"]
 
 app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+    await completeFinishedBookings()
+
     const { page, limit, skip } = getPaging(req.query, 10)
     const filter = {}
 
@@ -1283,6 +1311,9 @@ const sumPaid = async (filter) => {
 
 // admin analytics
 app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
+    // finished rentals count as completed before anything is calculated
+    await completeFinishedBookings()
+
     const [
         totalUsers,
         totalEquipment,
@@ -1314,6 +1345,8 @@ app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
 
 // owner analytics: only my own equipment and bookings
 app.get("/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
+    await completeFinishedBookings()
+
     const ownerId = req.user._id.toString()
 
     const [listedEquipment, paidRentals, completedRentals, totalEarnings, monthly] =
