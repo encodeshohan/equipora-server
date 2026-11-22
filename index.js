@@ -460,6 +460,9 @@ try {
     await bookings.createIndex({ customerId: 1, createdAt: -1 })
     await bookings.createIndex({ ownerId: 1, createdAt: -1 })
     await bookings.createIndex({ paymentStatus: 1, bookingStatus: 1, endDate: 1 })
+    await payments.createIndex({ status: 1, paymentDate: -1 })
+    await payments.createIndex({ ownerId: 1, paymentDate: -1 })
+    await payments.createIndex({ userId: 1, paymentDate: -1 })
 } catch (err) {
     console.error("Index setup failed:", err.message)
 }
@@ -951,6 +954,10 @@ app.post("/payments/checkout-verify", verifyToken, verifyRenter, async (req, res
     })
     if (!booking) return res.status(404).send({ message: "Booking not found" })
 
+    if (booking.bookingStatus === "cancelled" && booking.paymentStatus === "unpaid") {
+        return res.status(409).send({ message: "This booking was cancelled" })
+    }
+
     if (session.status !== "complete" || session.payment_status !== "paid") {
         return res.send({ success: false, message: "Payment has not been completed." })
     }
@@ -1244,6 +1251,56 @@ app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
     })
 })
 
+// admin: manage a rental (cancel it, or mark a paid rental as completed)
+const ADMIN_BOOKING_ACTIONS = {
+    cancelled: ["pending", "confirmed"],
+    completed: ["confirmed"],
+}
+
+app.patch("/admin/bookings/:id/status", verifyToken, verifyAdmin, async (req, res) => {
+    const id = toObjectId(req.params.id)
+    if (!id) return res.status(400).send({ message: "Invalid id" })
+
+    const next = req.body?.bookingStatus
+    if (typeof next !== "string" || !Object.hasOwn(ADMIN_BOOKING_ACTIONS, next)) {
+        return res.status(400).send({ message: "Status is invalid" })
+    }
+
+    const booking = await bookings.findOne({ _id: id })
+    if (!booking) return res.status(404).send({ message: "Booking not found" })
+
+    if (!ADMIN_BOOKING_ACTIONS[next].includes(booking.bookingStatus)) {
+        return res.status(409).send({
+            message: `A ${booking.bookingStatus} booking cannot be marked ${next}`,
+        })
+    }
+
+    // the status must still be what we just read (no double updates)
+    const result = await bookings.updateOne(
+        { _id: id, bookingStatus: booking.bookingStatus },
+        { $set: { bookingStatus: next, updatedAt: new Date() } }
+    )
+    if (result.matchedCount === 0) {
+        return res.status(409).send({ message: "This booking just changed. Refresh and try again." })
+    }
+
+    // an unpaid checkout is closed on Stripe so it can no longer be paid
+    if (
+        next === "cancelled" &&
+        booking.paymentStatus === "unpaid" &&
+        booking.stripeSessionId &&
+        stripe
+    ) {
+        try {
+            await stripe.checkout.sessions.expire(booking.stripeSessionId)
+        } catch (err) {
+            console.error("Stripe session expire failed:", err.message)
+        }
+    }
+
+    res.send({ acknowledged: true, bookingStatus: next })
+})
+
 // analytics helpers
 const MONTH_NAMES = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1268,23 +1325,28 @@ const lastMonths = (count) => {
 
 const roundMoney = (value) => Math.round((value ?? 0) * 100) / 100
 
-// paid bookings per month: { month, label, bookings, revenue }
+// verified payments per month: { month, label, bookings, revenue }
+// (one payment record exists per paid booking)
 const monthlyStats = async (baseFilter, count = 6) => {
     const months = lastMonths(count)
     const start = new Date(`${months[0].key}-01T00:00:00+06:00`)
 
-    const rows = await bookings
+    const rows = await payments
         .aggregate([
             {
-                $match: { ...baseFilter, paymentStatus: "paid", paidAt: { $gte: start } },
+                $match: { ...baseFilter, status: "paid", paymentDate: { $gte: start } },
             },
             {
                 $group: {
                     _id: {
-                        $dateToString: { format: "%Y-%m", date: "$paidAt", timezone: "Asia/Dhaka" },
+                        $dateToString: {
+                            format: "%Y-%m",
+                            date: "$paymentDate",
+                            timezone: "Asia/Dhaka",
+                        },
                     },
                     bookings: { $sum: 1 },
-                    revenue: { $sum: "$total" },
+                    revenue: { $sum: "$amount" },
                 },
             },
         ])
@@ -1299,11 +1361,12 @@ const monthlyStats = async (baseFilter, count = 6) => {
     }))
 }
 
-const sumPaid = async (filter) => {
-    const [row] = await bookings
+// total of verified payments
+const sumPayments = async (filter) => {
+    const [row] = await payments
         .aggregate([
-            { $match: { ...filter, paymentStatus: "paid" } },
-            { $group: { _id: null, total: { $sum: "$total" } } },
+            { $match: { ...filter, status: "paid" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
         ])
         .toArray()
     return roundMoney(row?.total)
@@ -1326,9 +1389,9 @@ app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
         users.countDocuments({}),
         equipment.countDocuments({}),
         equipment.countDocuments({ status: "pending" }),
-        bookings.countDocuments({ paymentStatus: "paid" }),
+        payments.countDocuments({ status: "paid" }),
         bookings.countDocuments({ bookingStatus: "completed" }),
-        sumPaid({}),
+        sumPayments({}),
         monthlyStats({}),
     ])
 
@@ -1352,13 +1415,31 @@ app.get("/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
     const [listedEquipment, paidRentals, completedRentals, totalEarnings, monthly] =
         await Promise.all([
             equipment.countDocuments({ ownerId }),
-            bookings.countDocuments({ ownerId, paymentStatus: "paid" }),
+            payments.countDocuments({ ownerId, status: "paid" }),
             bookings.countDocuments({ ownerId, bookingStatus: "completed" }),
-            sumPaid({ ownerId }),
+            sumPayments({ ownerId }),
             monthlyStats({ ownerId }),
         ])
 
     res.send({ listedEquipment, paidRentals, completedRentals, totalEarnings, monthly })
+})
+
+// customer analytics: only my own bookings and payments
+app.get("/customer/analytics", verifyToken, verifyRenter, async (req, res) => {
+    await completeFinishedBookings()
+
+    const userId = req.user._id.toString()
+
+    const [totalRentals, paidRentals, completedRentals, totalSpent, monthly] =
+        await Promise.all([
+            bookings.countDocuments({ customerId: userId }),
+            payments.countDocuments({ userId, status: "paid" }),
+            bookings.countDocuments({ customerId: userId, bookingStatus: "completed" }),
+            sumPayments({ userId }),
+            monthlyStats({ userId }),
+        ])
+
+    res.send({ totalRentals, paidRentals, completedRentals, totalSpent, monthly })
 })
 
 // 404 + error handler (Express 5 forwards rejected async handlers here)
